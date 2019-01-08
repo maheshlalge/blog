@@ -1,0 +1,104 @@
+Recently I had to write a RabbitMQ/pika client which listens to the RabbitMQ server using a BlockingConnection adapter. The client 
+receives the messages from the RabbitMQ queue, runs a map reduce job in hadoop and writes the result back into RabbitMQ queue. 
+The code worked fine for small loads, but as the map reduce jobs started taking more time ( and often unpredictable for execution time ! ) 
+the pika client started getting the connection reset from RabbitMQ Server. After debugging, I realized that the blocking message is not 
+acknowledged by the pika client and hence RabbitMQ Server thought the client to be lost and hence closed the connection with the client.
+
+To resolve the issue I tried multiple ways and finally the following method solved the problem. 
+
+Calling connection.process_data_events() periodically in the hadoop client call ( long running job ), sent heartbeat to RabbitMQ server 
+and when it is been called, it kept the pika client away from closing. The following code demonstrate the problem solving. The heartbeat 
+value is kept greater than the connection.process_data_events() period so the client heartbeat reaches the server before it resets the 
+connection.
+
+#!/usr/bin/env python
+
+import pika
+import threading
+heart_beat_value = 60
+time_out_value = 50
+
+##############################################
+# Keep alive the connection with RabbitMQ
+#
+class WorkerThread(threading.Thread):
+   
+    def __init__(self):
+        super(WorkerThread, self).__init__()
+        self.stoprequest = threading.Event()
+        self.sleeptimer = threading.Event()
+
+    def run(self):
+        while not self.stoprequest.isSet():
+            try:
+                print("Sending the heartbeat to RabbitMQ Server ..")
+                connection.process_data_events()
+                self.sleeptimer.wait(timeout=time_out_value) 
+            except:
+                continue
+
+    # Ask the thread to stop by calling its join() method
+    def join(self, timeout=None):
+        print("Stopping Worker Thread")
+        self.sleeptimer.set()
+        self.stoprequest.set()
+        super(WorkerThread, self).join(timeout)
+        print("Worker Thread Stopped")
+
+##############################################
+# Callback function 
+#
+def callback(ch, method, properties, body):
+
+    print(" [x] Received from queue %r" % body)
+
+    # Start the thread
+    mythread = WorkerThread()
+    mythread.start()
+
+    error_code = 1
+
+    # Run long running job
+    error_code = run_your_long_running_job(body)
+
+    #Stop the thread as the processing is over
+    mythread.join()
+    if(mythread.isAlive()):
+        print("Thread is Still Alive")
+
+    # Ack the queue 
+    if(error_code == 0):
+        print("Releasing the message from queue")
+        ch.basic_ack(delivery_tag = method.delivery_tag)
+    else:
+        print("Sending NACK to RabbitMQ as the message could not be processed")
+        ch.basic_nack(delivery_tag = method.delivery_tag)
+
+##############################################
+# Entry point
+#
+if __name__== "__main__":
+
+    rabbitmq_ip = "localhost"
+    rabbitmq_port = 5672
+    rabbitmq_user = "guest"
+    rabbitmq_passwd = "guest"
+
+    # Create the connection with RabbitMQ and start listening
+    params = pika.ConnectionParameters(heartbeat_interval=heart_beat_value,
+                                       credentials=pika.PlainCredentials(username=rabbitmq_user, password=rabbitmq_passwd),
+                                       host=rabbitmq_ip,port=rabbitmq_port)
+    connection = pika.BlockingConnection(params)
+    channel = connection.channel()
+    channel.queue_declare(queue='long_running_queue', durable=True)
+    channel.basic_qos(prefetch_count=1)
+    channel.basic_consume(callback,
+                      queue='long_running_queue')
+    try:
+        channel.start_consuming()
+    except KeyboardInterrupt:
+        channel.stop_consuming()
+
+    channel.close()
+    connection.close()
+    print("Closed the connection with the long_running_queue")
